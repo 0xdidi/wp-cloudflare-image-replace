@@ -1,8 +1,8 @@
 <?php
 /*
-Plugin Name: Cloudflare Image Replace
-Description: Replace all product images with Cloudflare-transformed versions in batches, with real-time progress tracking, stop/start functionality, and AJAX-based updates. Only processes product images.
-Version: 1.5
+Plugin Name: WP Image Replace
+Description: Replace all product images with Cloudflare-transformed versions in batches, with real-time progress tracking, stop/start functionality, and AJAX-based updates. Only processes product images and ensures images aren't processed more than once.
+Version: 1.6
 Author: Great Anthony
 */
 
@@ -10,7 +10,6 @@ if (!defined('ABSPATH')) {
     exit; // Exit if accessed directly.
 }
 
-// Setup constants
 define('CLOUD_IMAGE_REPLACE_BATCH_SIZE', 300);
 
 // Hook into admin menu
@@ -128,6 +127,11 @@ function cloudflare_image_replace_start() {
             WHERE p2.ID = pm.post_id 
             AND p2.post_type = 'product'
         )
+        AND NOT EXISTS (
+            SELECT 1 FROM {$wpdb->prefix}postmeta pm2
+            WHERE pm2.post_id = p.ID 
+            AND pm2.meta_key = '_cloudflare_image_processed'
+        )
     ");
 
     update_option('cloudflare_image_replace_total_images', $total_images);
@@ -152,7 +156,7 @@ function cloudflare_image_replace_stop() {
 // Cron Job Hook
 add_action('cloudflare_image_replace_cron', 'cloudflare_image_replace_cron');
 
-// Batch Processing Function - Now only processing images attached to products
+// Batch Processing Function - Now only processing images attached to products and not already processed
 function cloudflare_image_replace_cron() {
     if (!get_option('cloudflare_image_replace_in_progress')) {
         return; // Exit if no job is in progress
@@ -162,7 +166,7 @@ function cloudflare_image_replace_cron() {
     $offset = get_option('cloudflare_image_replace_offset', 0);
     $batch_size = CLOUD_IMAGE_REPLACE_BATCH_SIZE;
 
-    // Get a batch of product images (attached to product post type)
+    // Get a batch of product images that haven't been processed yet
     $query = $wpdb->prepare("
         SELECT p.ID, p.guid 
         FROM {$wpdb->prefix}posts p
@@ -173,6 +177,11 @@ function cloudflare_image_replace_cron() {
             SELECT 1 FROM {$wpdb->prefix}posts p2
             WHERE p2.ID = pm.post_id 
             AND p2.post_type = 'product'
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM {$wpdb->prefix}postmeta pm2
+            WHERE pm2.post_id = p.ID 
+            AND pm2.meta_key = '_cloudflare_image_processed'
         )
         LIMIT %d OFFSET %d", $batch_size, $offset);
 
@@ -191,37 +200,35 @@ function cloudflare_image_replace_cron() {
         // Generate Cloudflare transformation URL
         $cloudflare_url = 'https://img.offscent.co.uk/cdn-cgi/image/w=2500,h=2500,fit=pad,background=white,quality=100/' . $image_url;
 
-        // Get the image content from Cloudflare
+        // Get the image content from the Cloudflare URL
         $new_image_content = @file_get_contents($cloudflare_url);
 
-        if ($new_image_content) {
-            // Get the file path of the original image
-            $image_path = get_attached_file($image_id);
+        if ($new_image_content !== false) {
+            // Get the upload directory
+            $upload_dir = wp_upload_dir();
+            $old_image_path = str_replace($upload_dir['baseurl'], $upload_dir['basedir'], $image_url);
 
-            // Save the transformed image over the original one
-            file_put_contents($image_path, $new_image_content);
-
-            // Regenerate image sizes
-            wp_update_attachment_metadata($image_id, wp_generate_attachment_metadata($image_id, $image_path));
-
-            // Increment successful image count
-            $successful_images++;
-            update_option('cloudflare_image_replace_successful', $successful_images);
-
+            // Save the new image over the old one
+            if (file_put_contents($old_image_path, $new_image_content)) {
+                $successful_images++;
+                update_post_meta($image_id, '_cloudflare_image_processed', true); // Mark image as processed
+            } else {
+                $failed_images++;
+            }
         } else {
-            // Increment failed image count
             $failed_images++;
-            update_option('cloudflare_image_replace_failed', $failed_images);
         }
 
-        // Increment processed image count
         $processed_images++;
-        update_option('cloudflare_image_replace_processed', $processed_images);
     }
 
-    // Check if there are more images to process
-    if (count($images) < $batch_size) {
-        // No more images, stop the process
+    // Update progress tracking options
+    update_option('cloudflare_image_replace_processed', $processed_images);
+    update_option('cloudflare_image_replace_successful', $successful_images);
+    update_option('cloudflare_image_replace_failed', $failed_images);
+
+    // Check if we've processed all images
+    if ($processed_images >= get_option('cloudflare_image_replace_total_images')) {
         cloudflare_image_replace_stop();
     } else {
         // Update the offset for the next batch
