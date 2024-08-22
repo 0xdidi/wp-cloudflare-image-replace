@@ -1,0 +1,1 @@
+# wp-cloudflare-image-replace
